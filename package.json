@@ -1,0 +1,43 @@
+{
+  "name": "web-social-optimize",
+  "version": "1.0.0",
+  "description": "Generate all social media and SEO images from a single SVG logo",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "web-social-optimize": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "favicon",
+    "social-media",
+    "og-image",
+    "twitter-card",
+    "seo",
+    "image-generator",
+    "svg",
+    "pwa"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "sharp": "^0.33.5",
+    "svgo": "^3.3.2",
+    "to-ico": "^1.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/to-ico": "^1.1.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

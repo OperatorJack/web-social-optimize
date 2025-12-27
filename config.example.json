@@ -1,0 +1,22 @@
+{
+  "input": "./example-logo.svg",
+  "inputWide": "./example-logo-wide.svg",
+  "output": "./assets",
+  "background": "#ffffff",
+  "theme": "#1a73e8",
+  "social": {
+    "title": "Your Brand Name",
+    "tagline": "Your tagline goes here",
+    "font": "sans-serif",
+    "titleSize": 64,
+    "taglineSize": 32,
+    "titleColor": "#1a1a1a",
+    "taglineColor": "#666666"
+  },
+  "padding": {
+    "favicon": 0.1,
+    "social": 0.15,
+    "apple": 0.1,
+    "android": 0.1
+  }
+}
