@@ -232,31 +232,12 @@ export async function removeBackground(
     .toBuffer({ resolveWithObject: true });
 
   const { width, height, channels } = info;
-  const totalPixels = (data.length / channels);
 
-  // First pass: count how many pixels would be removed
-  let matchingPixels = 0;
-  for (let i = 0; i < data.length; i += channels) {
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    const pixelColor: RGB = { r, g, b };
+  // Note: detectBackgroundColor already checks that center differs from corners,
+  // so if we get here with an auto-detected color, it's a real background to remove.
+  // No additional percentage-based safeguard is needed.
 
-    if (colorsMatch(pixelColor, bgColor, colorTolerance)) {
-      matchingPixels++;
-    }
-  }
-
-  const removalPercentage = matchingPixels / totalPixels;
-
-  // Safeguard: if we would remove more than 80% of the image, skip removal
-  // This prevents destroying logos that fill most of the image
-  // Exception: if the user explicitly specified a background color, trust them
-  if (!isExplicitColor && removalPercentage > 0.8) {
-    return sharp(imageBuffer).ensureAlpha().png().toBuffer();
-  }
-
-  // Second pass: actually remove the background
+  // Remove the background
   const outputData = Buffer.alloc(data.length);
 
   for (let i = 0; i < data.length; i += channels) {
