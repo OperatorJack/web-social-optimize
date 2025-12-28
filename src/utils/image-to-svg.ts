@@ -36,6 +36,8 @@ export interface ImageToSvgOptions {
   turdPolicy?: 'black' | 'white' | 'left' | 'right' | 'minority' | 'majority';
   /** Curve optimization tolerance. Higher = smoother curves. Default: 0.2 */
   optTolerance?: number;
+  /** Preserve original colors from the image. Default: true */
+  preserveColors?: boolean;
 }
 
 interface RGB {
@@ -352,11 +354,211 @@ export async function trimAlpha(imageBuffer: Buffer): Promise<Buffer> {
 }
 
 /**
+ * Convert RGB to hex color string
+ */
+function rgbToHex(color: RGB): string {
+  const toHex = (n: number) => n.toString(16).padStart(2, '0');
+  return `#${toHex(color.r)}${toHex(color.g)}${toHex(color.b)}`;
+}
+
+/**
+ * Extract unique colors from an image (ignoring transparent pixels)
+ * Groups similar colors together based on tolerance
+ */
+async function extractUniqueColors(
+  imageBuffer: Buffer,
+  tolerance: number = 20
+): Promise<RGB[]> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4;
+  const colorCounts = new Map<string, { color: RGB; count: number }>();
+
+  // Count all opaque pixel colors
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = data[i + 3];
+    if (alpha < 128) continue; // Skip transparent pixels
+
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const key = `${r},${g},${b}`;
+
+    const existing = colorCounts.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      colorCounts.set(key, { color: { r, g, b }, count: 1 });
+    }
+  }
+
+  // Sort by frequency (most common first)
+  const sortedColors = [...colorCounts.values()]
+    .sort((a, b) => b.count - a.count)
+    .map(c => c.color);
+
+  // Group similar colors together
+  const uniqueColors: RGB[] = [];
+  for (const color of sortedColors) {
+    const isSimilarToExisting = uniqueColors.some(
+      existing => colorsMatch(color, existing, tolerance)
+    );
+    if (!isSimilarToExisting) {
+      uniqueColors.push(color);
+    }
+  }
+
+  return uniqueColors;
+}
+
+/**
+ * Create a binary mask for a specific color
+ * Pixels matching the color become black, others become white
+ */
+async function createColorMask(
+  imageBuffer: Buffer,
+  targetColor: RGB,
+  tolerance: number = 20
+): Promise<Buffer> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4;
+
+  // Create grayscale output (1 channel)
+  const maskData = Buffer.alloc(width * height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const srcIdx = (y * width + x) * channels;
+      const dstIdx = y * width + x;
+
+      const r = data[srcIdx];
+      const g = data[srcIdx + 1];
+      const b = data[srcIdx + 2];
+      const alpha = data[srcIdx + 3];
+
+      const pixelColor: RGB = { r, g, b };
+
+      // Black (0) where color matches, white (255) elsewhere
+      if (alpha >= 128 && colorsMatch(pixelColor, targetColor, tolerance)) {
+        maskData[dstIdx] = 0; // Black - will be traced
+      } else {
+        maskData[dstIdx] = 255; // White - background
+      }
+    }
+  }
+
+  return sharp(maskData, {
+    raw: { width, height, channels: 1 }
+  }).png().toBuffer();
+}
+
+/**
+ * Extract path data from an SVG string
+ */
+function extractPathFromSvg(svg: string): string | null {
+  const pathMatch = svg.match(/<path[^>]*\sd="([^"]+)"/);
+  return pathMatch ? pathMatch[1] : null;
+}
+
+/**
+ * Extract viewBox dimensions from an SVG string
+ */
+function extractViewBox(svg: string): { width: number; height: number } | null {
+  const viewBoxMatch = svg.match(/viewBox="0 0 (\d+) (\d+)"/);
+  if (viewBoxMatch) {
+    return { width: parseInt(viewBoxMatch[1]), height: parseInt(viewBoxMatch[2]) };
+  }
+  const dimMatch = svg.match(/width="(\d+)"[^>]*height="(\d+)"/);
+  if (dimMatch) {
+    return { width: parseInt(dimMatch[1]), height: parseInt(dimMatch[2]) };
+  }
+  return null;
+}
+
+/**
+ * Convert a raster image to SVG with color preservation
+ */
+async function vectorizeWithColors(
+  imageBuffer: Buffer,
+  options: {
+    turdPolicy?: potrace.PotraceOptions['turdPolicy'];
+    optTolerance?: number;
+    colorTolerance?: number;
+  } = {}
+): Promise<string> {
+  const {
+    turdPolicy = 'minority',
+    optTolerance = 0.2,
+    colorTolerance = 20,
+  } = options;
+
+  // Extract unique colors from the image
+  const colors = await extractUniqueColors(imageBuffer, colorTolerance);
+
+  if (colors.length === 0) {
+    // No colors found, return empty SVG
+    const metadata = await sharp(imageBuffer).metadata();
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${metadata.width}" height="${metadata.height}" viewBox="0 0 ${metadata.width} ${metadata.height}"></svg>`;
+  }
+
+  const paths: { color: string; d: string }[] = [];
+  let viewBox: { width: number; height: number } | null = null;
+
+  // Trace each color separately
+  for (const color of colors) {
+    const mask = await createColorMask(imageBuffer, color, colorTolerance);
+
+    const potraceOptions: potrace.PotraceOptions = {
+      threshold: 128,
+      turdPolicy,
+      optTolerance,
+      optCurve: true,
+      background: 'transparent',
+      color: 'black',
+    };
+
+    const svg = await traceAsync(mask, potraceOptions);
+    const pathData = extractPathFromSvg(svg);
+
+    if (pathData && pathData.trim()) {
+      paths.push({ color: rgbToHex(color), d: pathData });
+      if (!viewBox) {
+        viewBox = extractViewBox(svg);
+      }
+    }
+  }
+
+  if (paths.length === 0 || !viewBox) {
+    // Fallback: return simple trace
+    const metadata = await sharp(imageBuffer).metadata();
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${metadata.width}" height="${metadata.height}" viewBox="0 0 ${metadata.width} ${metadata.height}"></svg>`;
+  }
+
+  // Combine all paths into a single SVG
+  const pathElements = paths
+    .map(p => `\t<path d="${p.d}" fill="${p.color}" fill-rule="evenodd"/>`)
+    .join('\n');
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${viewBox.width}" height="${viewBox.height}" viewBox="0 0 ${viewBox.width} ${viewBox.height}" version="1.1">
+${pathElements}
+</svg>`;
+}
+
+/**
  * Convert a raster image to SVG using potrace vectorization
  */
 export async function vectorizeImage(
   imageBuffer: Buffer,
-  options: Omit<ImageToSvgOptions, 'backgroundColor' | 'colorTolerance'> = {}
+  options: Omit<ImageToSvgOptions, 'backgroundColor'> = {}
 ): Promise<string> {
   const {
     invert = false,
@@ -364,9 +566,20 @@ export async function vectorizeImage(
     colorCount = 2,
     turdPolicy = 'minority',
     optTolerance = 0.2,
+    preserveColors = true,
+    colorTolerance = 20,
   } = options;
 
-  // Convert to grayscale for better tracing
+  // Use color-preserving vectorization by default
+  if (preserveColors) {
+    return vectorizeWithColors(imageBuffer, {
+      turdPolicy,
+      optTolerance,
+      colorTolerance,
+    });
+  }
+
+  // Fallback to grayscale tracing
   const processedBuffer = await sharp(imageBuffer)
     .grayscale()
     .png()
@@ -438,6 +651,8 @@ export async function convertImageToSvg(
     colorCount: options.colorCount,
     turdPolicy: options.turdPolicy,
     optTolerance: options.optTolerance,
+    preserveColors: options.preserveColors ?? true,
+    colorTolerance: options.colorTolerance,
   });
 
   return svg;
