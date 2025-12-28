@@ -44,6 +44,10 @@ interface RGB {
   b: number;
 }
 
+interface RGBA extends RGB {
+  a: number;
+}
+
 /**
  * Parse a hex color string to RGB values
  */
@@ -68,7 +72,7 @@ function colorsMatch(c1: RGB, c2: RGB, tolerance: number): boolean {
 }
 
 /**
- * Sample average color from a region of an image
+ * Sample average color from a region of an image, including alpha
  */
 async function sampleRegionColor(
   imageBuffer: Buffer,
@@ -76,33 +80,37 @@ async function sampleRegionColor(
   top: number,
   width: number,
   height: number
-): Promise<RGB> {
+): Promise<RGBA> {
   const regionBuffer = await sharp(imageBuffer)
+    .ensureAlpha()
     .extract({ left, top, width, height })
     .raw()
     .toBuffer({ resolveWithObject: true });
 
   const { data, info } = regionBuffer;
-  const channels = info.channels;
-  let rSum = 0, gSum = 0, bSum = 0;
+  const channels = info.channels; // Should be 4 (RGBA) after ensureAlpha
+  let rSum = 0, gSum = 0, bSum = 0, aSum = 0;
   const pixelCount = data.length / channels;
 
   for (let i = 0; i < data.length; i += channels) {
     rSum += data[i];
     gSum += data[i + 1];
     bSum += data[i + 2];
+    aSum += channels >= 4 ? data[i + 3] : 255;
   }
 
   return {
     r: Math.round(rSum / pixelCount),
     g: Math.round(gSum / pixelCount),
     b: Math.round(bSum / pixelCount),
+    a: Math.round(aSum / pixelCount),
   };
 }
 
 /**
  * Detect the dominant corner color which is likely the background.
  * Returns null if:
+ * - Corners are already transparent (background is already removed)
  * - Corners don't match each other (no consistent background)
  * - Center matches corners (logo fills the image, no distinct background)
  */
@@ -131,7 +139,7 @@ async function detectBackgroundColor(imageBuffer: Buffer): Promise<RGB | null> {
     { left: width - sampleSize, top: height - sampleSize },
   ];
 
-  const cornerColors: RGB[] = [];
+  const cornerColors: RGBA[] = [];
   for (const corner of corners) {
     const color = await sampleRegionColor(
       imageBuffer,
@@ -141,6 +149,13 @@ async function detectBackgroundColor(imageBuffer: Buffer): Promise<RGB | null> {
       Math.min(sampleSize, height)
     );
     cornerColors.push(color);
+  }
+
+  // Check if corners are mostly transparent - if so, background is already removed
+  const avgAlpha = cornerColors.reduce((sum, c) => sum + c.a, 0) / cornerColors.length;
+  if (avgAlpha < 128) {
+    // Corners are mostly transparent, no background removal needed
+    return null;
   }
 
   // Check if all corners have similar colors
