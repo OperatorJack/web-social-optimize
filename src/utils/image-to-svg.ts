@@ -68,8 +68,43 @@ function colorsMatch(c1: RGB, c2: RGB, tolerance: number): boolean {
 }
 
 /**
- * Detect the dominant corner color which is likely the background
- * Samples the four corners of the image
+ * Sample average color from a region of an image
+ */
+async function sampleRegionColor(
+  imageBuffer: Buffer,
+  left: number,
+  top: number,
+  width: number,
+  height: number
+): Promise<RGB> {
+  const regionBuffer = await sharp(imageBuffer)
+    .extract({ left, top, width, height })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { data, info } = regionBuffer;
+  const channels = info.channels;
+  let rSum = 0, gSum = 0, bSum = 0;
+  const pixelCount = data.length / channels;
+
+  for (let i = 0; i < data.length; i += channels) {
+    rSum += data[i];
+    gSum += data[i + 1];
+    bSum += data[i + 2];
+  }
+
+  return {
+    r: Math.round(rSum / pixelCount),
+    g: Math.round(gSum / pixelCount),
+    b: Math.round(bSum / pixelCount),
+  };
+}
+
+/**
+ * Detect the dominant corner color which is likely the background.
+ * Returns null if:
+ * - Corners don't match each other (no consistent background)
+ * - Center matches corners (logo fills the image, no distinct background)
  */
 async function detectBackgroundColor(imageBuffer: Buffer): Promise<RGB | null> {
   const image = sharp(imageBuffer);
@@ -82,68 +117,74 @@ async function detectBackgroundColor(imageBuffer: Buffer): Promise<RGB | null> {
   const width = metadata.width;
   const height = metadata.height;
 
-  // Sample size for corners (5x5 pixels)
-  const sampleSize = 5;
+  // Sample size for regions
+  const sampleSize = Math.min(10, Math.floor(Math.min(width, height) / 10));
+  if (sampleSize < 2) {
+    return null; // Image too small for reliable detection
+  }
 
-  // Extract corners and analyze their colors
+  // Sample the four corners
   const corners = [
-    { left: 0, top: 0 }, // Top-left
-    { left: width - sampleSize, top: 0 }, // Top-right
-    { left: 0, top: height - sampleSize }, // Bottom-left
-    { left: width - sampleSize, top: height - sampleSize }, // Bottom-right
+    { left: 0, top: 0 },
+    { left: width - sampleSize, top: 0 },
+    { left: 0, top: height - sampleSize },
+    { left: width - sampleSize, top: height - sampleSize },
   ];
 
   const cornerColors: RGB[] = [];
-
   for (const corner of corners) {
-    const cornerBuffer = await sharp(imageBuffer)
-      .extract({
-        left: Math.max(0, corner.left),
-        top: Math.max(0, corner.top),
-        width: Math.min(sampleSize, width),
-        height: Math.min(sampleSize, height)
-      })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    // Get average color of the corner sample
-    const { data, info } = cornerBuffer;
-    const channels = info.channels;
-    let rSum = 0, gSum = 0, bSum = 0;
-    const pixelCount = data.length / channels;
-
-    for (let i = 0; i < data.length; i += channels) {
-      rSum += data[i];
-      gSum += data[i + 1];
-      bSum += data[i + 2];
-    }
-
-    cornerColors.push({
-      r: Math.round(rSum / pixelCount),
-      g: Math.round(gSum / pixelCount),
-      b: Math.round(bSum / pixelCount),
-    });
+    const color = await sampleRegionColor(
+      imageBuffer,
+      Math.max(0, corner.left),
+      Math.max(0, corner.top),
+      Math.min(sampleSize, width),
+      Math.min(sampleSize, height)
+    );
+    cornerColors.push(color);
   }
 
-  // Check if all corners have similar colors (likely background)
+  // Check if all corners have similar colors
   const tolerance = 30;
   const baseColor = cornerColors[0];
-  const allMatch = cornerColors.every(c => colorsMatch(c, baseColor, tolerance));
+  const allCornersMatch = cornerColors.every(c => colorsMatch(c, baseColor, tolerance));
 
-  if (allMatch) {
-    // Return average of all corner colors
-    return {
-      r: Math.round(cornerColors.reduce((sum, c) => sum + c.r, 0) / cornerColors.length),
-      g: Math.round(cornerColors.reduce((sum, c) => sum + c.g, 0) / cornerColors.length),
-      b: Math.round(cornerColors.reduce((sum, c) => sum + c.b, 0) / cornerColors.length),
-    };
+  if (!allCornersMatch) {
+    // Corners don't match - no consistent background detected
+    return null;
   }
 
-  return null;
+  // Average corner color
+  const avgCornerColor: RGB = {
+    r: Math.round(cornerColors.reduce((sum, c) => sum + c.r, 0) / cornerColors.length),
+    g: Math.round(cornerColors.reduce((sum, c) => sum + c.g, 0) / cornerColors.length),
+    b: Math.round(cornerColors.reduce((sum, c) => sum + c.b, 0) / cornerColors.length),
+  };
+
+  // Sample the center of the image
+  const centerSize = Math.min(sampleSize * 2, Math.floor(Math.min(width, height) / 4));
+  const centerLeft = Math.floor((width - centerSize) / 2);
+  const centerTop = Math.floor((height - centerSize) / 2);
+
+  const centerColor = await sampleRegionColor(
+    imageBuffer,
+    centerLeft,
+    centerTop,
+    centerSize,
+    centerSize
+  );
+
+  // If the center matches the corners, the logo likely fills the entire image
+  // In this case, we should NOT remove the "background" as it's actually the logo
+  if (colorsMatch(centerColor, avgCornerColor, tolerance)) {
+    return null;
+  }
+
+  return avgCornerColor;
 }
 
 /**
- * Remove background color from an image, making it transparent
+ * Remove background color from an image, making it transparent.
+ * Includes safeguards to prevent removing too much of the image.
  */
 export async function removeBackground(
   imageBuffer: Buffer,
@@ -153,8 +194,11 @@ export async function removeBackground(
 
   // Determine background color
   let bgColor: RGB;
+  let isExplicitColor = false;
+
   if (options.backgroundColor) {
     bgColor = parseHexColor(options.backgroundColor);
+    isExplicitColor = true;
   } else {
     const detected = await detectBackgroundColor(imageBuffer);
     if (!detected) {
@@ -171,9 +215,33 @@ export async function removeBackground(
     .toBuffer({ resolveWithObject: true });
 
   const { width, height, channels } = info;
+  const totalPixels = (data.length / channels);
+
+  // First pass: count how many pixels would be removed
+  let matchingPixels = 0;
+  for (let i = 0; i < data.length; i += channels) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    const pixelColor: RGB = { r, g, b };
+
+    if (colorsMatch(pixelColor, bgColor, colorTolerance)) {
+      matchingPixels++;
+    }
+  }
+
+  const removalPercentage = matchingPixels / totalPixels;
+
+  // Safeguard: if we would remove more than 80% of the image, skip removal
+  // This prevents destroying logos that fill most of the image
+  // Exception: if the user explicitly specified a background color, trust them
+  if (!isExplicitColor && removalPercentage > 0.8) {
+    return sharp(imageBuffer).ensureAlpha().png().toBuffer();
+  }
+
+  // Second pass: actually remove the background
   const outputData = Buffer.alloc(data.length);
 
-  // Process each pixel
   for (let i = 0; i < data.length; i += channels) {
     const r = data[i];
     const g = data[i + 1];
