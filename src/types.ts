@@ -70,6 +70,8 @@ export interface ImageToSvgConfig {
   alphaMax?: number;
   /** Upscale factor before tracing for smoother curves. Default: 2 */
   upscale?: number;
+  /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
+  gradientCleanup?: number;
 }
 
 export const defaultImageToSvgConfig: ImageToSvgConfig = {
@@ -82,4 +84,5 @@ export const defaultImageToSvgConfig: ImageToSvgConfig = {
   turdSize: 2,
   alphaMax: 0.75,
   upscale: 2,
+  gradientCleanup: 0,
 };

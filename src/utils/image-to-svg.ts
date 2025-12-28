@@ -44,6 +44,8 @@ export interface ImageToSvgOptions {
   alphaMax?: number;
   /** Upscale factor before tracing for smoother curves. Default: 2 */
   upscale?: number;
+  /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
+  gradientCleanup?: number;
 }
 
 interface RGB {
@@ -277,6 +279,201 @@ export async function removeBackground(
   })
     .png()
     .toBuffer();
+}
+
+/**
+ * Check if a color lies on a gradient between two other colors.
+ * Returns true if the test color is "between" color1 and color2 in RGB space.
+ */
+function isColorOnGradient(test: RGB, color1: RGB, color2: RGB, tolerance: number): boolean {
+  // Check if test color is between color1 and color2 for each channel
+  const isBetween = (v: number, a: number, b: number, tol: number): boolean => {
+    const min = Math.min(a, b) - tol;
+    const max = Math.max(a, b) + tol;
+    return v >= min && v <= max;
+  };
+
+  return (
+    isBetween(test.r, color1.r, color2.r, tolerance) &&
+    isBetween(test.g, color1.g, color2.g, tolerance) &&
+    isBetween(test.b, color1.b, color2.b, tolerance)
+  );
+}
+
+/**
+ * Get the dominant (most frequent) non-transparent color from an image
+ */
+async function getDominantColor(imageBuffer: Buffer): Promise<RGB | null> {
+  const { data } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const channels = 4;
+  const colorCounts = new Map<string, { color: RGB; count: number }>();
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = data[i + 3];
+    if (alpha < 128) continue;
+
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    // Quantize to reduce noise
+    const qr = Math.round(r / 8) * 8;
+    const qg = Math.round(g / 8) * 8;
+    const qb = Math.round(b / 8) * 8;
+    const key = `${qr},${qg},${qb}`;
+
+    const existing = colorCounts.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      colorCounts.set(key, { color: { r: qr, g: qg, b: qb }, count: 1 });
+    }
+  }
+
+  if (colorCounts.size === 0) return null;
+
+  const sorted = [...colorCounts.values()].sort((a, b) => b.count - a.count);
+  return sorted[0].color;
+}
+
+/**
+ * Clean up gradient bleeding at edges.
+ * This function removes transitional gradient pixels that appear at the edges
+ * between the main content and the (now transparent) background.
+ *
+ * The algorithm works in multiple passes:
+ * 1. Find edge pixels (adjacent to transparent pixels)
+ * 2. For edge pixels, check if they appear to be gradient transitions
+ * 3. Remove transitional pixels and repeat for specified number of iterations
+ */
+export async function cleanupGradientEdges(
+  imageBuffer: Buffer,
+  options: {
+    /** The original background color that was removed */
+    backgroundColor?: RGB;
+    /** Number of cleanup passes (higher = more aggressive). Default: 2 */
+    passes?: number;
+    /** Tolerance for detecting gradient colors. Default: 40 */
+    gradientTolerance?: number;
+  } = {}
+): Promise<Buffer> {
+  const {
+    passes = 2,
+    gradientTolerance = 40,
+  } = options;
+
+  // Get dominant content color to help identify gradient transitions
+  const dominantColor = await getDominantColor(imageBuffer);
+  if (!dominantColor) {
+    return imageBuffer;
+  }
+
+  let currentBuffer = imageBuffer;
+
+  for (let pass = 0; pass < passes; pass++) {
+    const { data, info } = await sharp(currentBuffer)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const { width, height } = info;
+    const channels = 4;
+    const outputData = Buffer.from(data);
+
+    let pixelsRemoved = 0;
+
+    // Find and remove edge pixels that appear to be gradient transitions
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * channels;
+        const alpha = data[idx + 3];
+
+        // Skip already transparent pixels
+        if (alpha < 128) continue;
+
+        const pixelColor: RGB = {
+          r: data[idx],
+          g: data[idx + 1],
+          b: data[idx + 2],
+        };
+
+        // Check if this is an edge pixel (has transparent neighbor)
+        let hasTransparentNeighbor = false;
+        let transparentNeighborCount = 0;
+        const neighbors = [
+          [-1, -1], [0, -1], [1, -1],
+          [-1, 0],          [1, 0],
+          [-1, 1],  [0, 1],  [1, 1],
+        ];
+
+        for (const [dx, dy] of neighbors) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            const nidx = (ny * width + nx) * channels;
+            if (data[nidx + 3] < 128) {
+              hasTransparentNeighbor = true;
+              transparentNeighborCount++;
+            }
+          }
+        }
+
+        if (!hasTransparentNeighbor) continue;
+
+        // This is an edge pixel - check if it looks like a gradient transition
+        // A gradient pixel is one that:
+        // 1. Is different from the dominant color (not the main content)
+        // 2. Could be a blend between dominant color and background (lighter/darker version)
+
+        const isNearDominant = colorsMatch(pixelColor, dominantColor, gradientTolerance);
+
+        if (!isNearDominant) {
+          // This pixel is different from the dominant color
+          // Check if it appears to be a transitional color (lighter/desaturated version)
+
+          // Calculate how "washed out" this color is compared to dominant
+          // Gradient bleeding often creates colors that are closer to white/gray
+          const dominantIntensity = (dominantColor.r + dominantColor.g + dominantColor.b) / 3;
+          const pixelIntensity = (pixelColor.r + pixelColor.g + pixelColor.b) / 3;
+
+          // Check if this appears to be a faded/washed version of the dominant color
+          // by checking if the color is shifting towards lighter or has reduced saturation
+          const intensityDiff = Math.abs(pixelIntensity - dominantIntensity);
+          const isWashedOut = intensityDiff > 20 && intensityDiff < 150;
+
+          // Also check if the color ratios are similar (same hue but different brightness)
+          const dominantTotal = dominantColor.r + dominantColor.g + dominantColor.b || 1;
+          const pixelTotal = pixelColor.r + pixelColor.g + pixelColor.b || 1;
+
+          const rRatioDiff = Math.abs(dominantColor.r / dominantTotal - pixelColor.r / pixelTotal);
+          const gRatioDiff = Math.abs(dominantColor.g / dominantTotal - pixelColor.g / pixelTotal);
+          const bRatioDiff = Math.abs(dominantColor.b / dominantTotal - pixelColor.b / pixelTotal);
+          const isSimilarHue = (rRatioDiff + gRatioDiff + bRatioDiff) < 0.3;
+
+          // If it's a washed-out version of the dominant color at an edge, remove it
+          if ((isWashedOut && isSimilarHue) || transparentNeighborCount >= 4) {
+            outputData[idx] = 0;
+            outputData[idx + 1] = 0;
+            outputData[idx + 2] = 0;
+            outputData[idx + 3] = 0;
+            pixelsRemoved++;
+          }
+        }
+      }
+    }
+
+    // If no pixels were removed in this pass, we're done
+    if (pixelsRemoved === 0) break;
+
+    currentBuffer = await sharp(outputData, {
+      raw: { width, height, channels: 4 },
+    }).png().toBuffer();
+  }
+
+  return currentBuffer;
 }
 
 /**
@@ -666,8 +863,9 @@ export async function vectorizeImage(
 /**
  * Main conversion pipeline: Image to SVG
  * 1. Remove solid color background
- * 2. Trim transparent space
- * 3. Vectorize to SVG
+ * 2. Clean up gradient bleeding (optional)
+ * 3. Trim transparent space
+ * 4. Vectorize to SVG
  */
 export async function convertImageToSvg(
   input: Buffer | string,
@@ -687,10 +885,19 @@ export async function convertImageToSvg(
     colorTolerance: options.colorTolerance,
   });
 
-  // Step 2: Trim alpha space
-  const trimmed = await trimAlpha(noBackground);
+  // Step 2: Clean up gradient bleeding at edges (if enabled)
+  let cleanedImage = noBackground;
+  if (options.gradientCleanup && options.gradientCleanup > 0) {
+    cleanedImage = await cleanupGradientEdges(noBackground, {
+      passes: Math.ceil(options.gradientCleanup / 2),  // 1-2 passes for value 1-4, 3+ for higher
+      gradientTolerance: 30 + options.gradientCleanup * 5,  // Scale tolerance with cleanup level
+    });
+  }
 
-  // Step 3: Vectorize to SVG
+  // Step 3: Trim alpha space
+  const trimmed = await trimAlpha(cleanedImage);
+
+  // Step 4: Vectorize to SVG
   const svg = await vectorizeImage(trimmed, {
     invert: options.invert,
     threshold: options.threshold,

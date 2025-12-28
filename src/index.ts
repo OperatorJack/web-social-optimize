@@ -158,6 +158,7 @@ program
   .option('--turd-size <number>', 'Suppress speckles up to this size in pixels (lower = more detail)', '2')
   .option('--alpha-max <number>', 'Corner sharpness (0-1.33, lower = sharper corners)', '0.75')
   .option('--upscale <number>', 'Upscale factor before tracing for smoother curves (1-4)', '2')
+  .option('--gradient-cleanup <number>', 'Clean up gradient bleeding at edges (0=off, 1-5=intensity). Use for logos with gradient text on solid backgrounds.', '0')
   .action(async (input, options) => {
     console.log(chalk.bold('\n🎨 Image to SVG Conversion\n'));
 
@@ -178,6 +179,7 @@ program
       console.log(chalk.dim(`Output: ${outputPath}\n`));
 
       // Build conversion options
+      const gradientCleanup = parseInt(options.gradientCleanup, 10);
       const convertOptions: ImageToSvgConfig = {
         ...defaultImageToSvgConfig,
         backgroundColor: options.background,
@@ -190,10 +192,14 @@ program
         turdSize: parseInt(options.turdSize, 10),
         alphaMax: parseFloat(options.alphaMax),
         upscale: parseFloat(options.upscale),
+        gradientCleanup,
       };
 
       console.log(chalk.dim('Processing...'));
       console.log(chalk.dim('  - Removing background'));
+      if (gradientCleanup > 0) {
+        console.log(chalk.dim(`  - Cleaning up gradient edges (intensity: ${gradientCleanup})`));
+      }
       console.log(chalk.dim('  - Trimming transparent space'));
       console.log(chalk.dim('  - Vectorizing image\n'));
 
