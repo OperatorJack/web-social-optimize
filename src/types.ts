@@ -62,8 +62,14 @@ export interface ImageToSvgConfig {
   colorCount?: number;
   /** Turd policy for potrace tracing (how to resolve ambiguities) */
   turdPolicy?: 'black' | 'white' | 'left' | 'right' | 'minority' | 'majority';
-  /** Curve optimization tolerance. Higher = smoother curves. Default: 0.2 */
+  /** Curve optimization tolerance. Lower = more accurate curves. Default: 0.1 */
   optTolerance?: number;
+  /** Suppress speckles of up to this many pixels. Lower = more detail. Default: 2 */
+  turdSize?: number;
+  /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
+  alphaMax?: number;
+  /** Upscale factor before tracing for smoother curves. Default: 2 */
+  upscale?: number;
 }
 
 export const defaultImageToSvgConfig: ImageToSvgConfig = {
@@ -72,5 +78,8 @@ export const defaultImageToSvgConfig: ImageToSvgConfig = {
   threshold: 128,
   colorCount: 2,
   turdPolicy: 'minority',
-  optTolerance: 0.2,
+  optTolerance: 0.1,
+  turdSize: 2,
+  alphaMax: 0.75,
+  upscale: 2,
 };

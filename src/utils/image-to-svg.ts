@@ -34,10 +34,16 @@ export interface ImageToSvgOptions {
   colorCount?: number;
   /** Turd policy for potrace (how to resolve ambiguities). Default: 'minority' */
   turdPolicy?: 'black' | 'white' | 'left' | 'right' | 'minority' | 'majority';
-  /** Curve optimization tolerance. Higher = smoother curves. Default: 0.2 */
+  /** Curve optimization tolerance. Lower = more accurate curves. Default: 0.1 */
   optTolerance?: number;
   /** Preserve original colors from the image. Default: true */
   preserveColors?: boolean;
+  /** Suppress speckles of up to this many pixels. Lower = more detail. Default: 2 */
+  turdSize?: number;
+  /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
+  alphaMax?: number;
+  /** Upscale factor before tracing for smoother curves. Default: 2 */
+  upscale?: number;
 }
 
 interface RGB {
@@ -211,11 +217,9 @@ export async function removeBackground(
 
   // Determine background color
   let bgColor: RGB;
-  let isExplicitColor = false;
 
   if (options.backgroundColor) {
     bgColor = parseHexColor(options.backgroundColor);
-    isExplicitColor = true;
   } else {
     const detected = await detectBackgroundColor(imageBuffer);
     if (!detected) {
@@ -350,12 +354,11 @@ async function extractUniqueColors(
   imageBuffer: Buffer,
   tolerance: number = 20
 ): Promise<RGB[]> {
-  const { data, info } = await sharp(imageBuffer)
+  const { data } = await sharp(imageBuffer)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const { width, height } = info;
   const channels = 4;
   const colorCounts = new Map<string, { color: RGB; count: number }>();
 
@@ -466,6 +469,48 @@ function extractViewBox(svg: string): { width: number; height: number } | null {
 }
 
 /**
+ * Upscale an image for better tracing quality.
+ * Upscaling before tracing produces smoother curves.
+ */
+async function upscaleForTracing(
+  imageBuffer: Buffer,
+  scaleFactor: number = 2
+): Promise<{ buffer: Buffer; scale: number; originalWidth: number; originalHeight: number }> {
+  const metadata = await sharp(imageBuffer).metadata();
+  const originalWidth = metadata.width || 0;
+  const originalHeight = metadata.height || 0;
+
+  if (originalWidth === 0 || originalHeight === 0) {
+    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
+  }
+
+  // Limit maximum dimensions to prevent memory issues
+  const maxDimension = 4000;
+  const currentMax = Math.max(originalWidth, originalHeight);
+
+  // Adjust scale factor if resulting image would be too large
+  let effectiveScale = scaleFactor;
+  if (currentMax * scaleFactor > maxDimension) {
+    effectiveScale = maxDimension / currentMax;
+  }
+
+  if (effectiveScale <= 1) {
+    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
+  }
+
+  const upscaled = await sharp(imageBuffer)
+    .resize({
+      width: Math.round(originalWidth * effectiveScale),
+      height: Math.round(originalHeight * effectiveScale),
+      kernel: 'lanczos3',  // High-quality upscaling
+    })
+    .png()
+    .toBuffer();
+
+  return { buffer: upscaled, scale: effectiveScale, originalWidth, originalHeight };
+}
+
+/**
  * Convert a raster image to SVG with color preservation
  */
 async function vectorizeWithColors(
@@ -474,33 +519,43 @@ async function vectorizeWithColors(
     turdPolicy?: potrace.PotraceOptions['turdPolicy'];
     optTolerance?: number;
     colorTolerance?: number;
+    turdSize?: number;
+    alphaMax?: number;
+    upscale?: number;
   } = {}
 ): Promise<string> {
   const {
     turdPolicy = 'minority',
-    optTolerance = 0.2,
+    optTolerance = 0.1,  // Lower = more accurate curves
     colorTolerance = 20,
+    turdSize = 2,        // Suppress tiny speckles only
+    alphaMax = 0.75,     // Sharper corners (0 = very sharp, 1.33 = very round)
+    upscale = 2,         // Upscale factor for smoother tracing
   } = options;
 
-  // Extract unique colors from the image
-  const colors = await extractUniqueColors(imageBuffer, colorTolerance);
+  // Upscale image for better tracing quality
+  const { buffer: processBuffer, originalWidth, originalHeight } = await upscaleForTracing(imageBuffer, upscale);
+
+  // Extract unique colors from the upscaled image
+  const colors = await extractUniqueColors(processBuffer, colorTolerance);
 
   if (colors.length === 0) {
-    // No colors found, return empty SVG
-    const metadata = await sharp(imageBuffer).metadata();
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${metadata.width}" height="${metadata.height}" viewBox="0 0 ${metadata.width} ${metadata.height}"></svg>`;
+    // No colors found, return empty SVG with original dimensions
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
   }
 
   const paths: { color: string; d: string }[] = [];
-  let viewBox: { width: number; height: number } | null = null;
+  let tracedViewBox: { width: number; height: number } | null = null;
 
-  // Trace each color separately
+  // Trace each color separately using the upscaled buffer
   for (const color of colors) {
-    const mask = await createColorMask(imageBuffer, color, colorTolerance);
+    const mask = await createColorMask(processBuffer, color, colorTolerance);
 
     const potraceOptions: potrace.PotraceOptions = {
       threshold: 128,
       turdPolicy,
+      turdSize,
+      alphaMax,
       optTolerance,
       optCurve: true,
       background: 'transparent',
@@ -512,16 +567,15 @@ async function vectorizeWithColors(
 
     if (pathData && pathData.trim()) {
       paths.push({ color: rgbToHex(color), d: pathData });
-      if (!viewBox) {
-        viewBox = extractViewBox(svg);
+      if (!tracedViewBox) {
+        tracedViewBox = extractViewBox(svg);
       }
     }
   }
 
-  if (paths.length === 0 || !viewBox) {
-    // Fallback: return simple trace
-    const metadata = await sharp(imageBuffer).metadata();
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${metadata.width}" height="${metadata.height}" viewBox="0 0 ${metadata.width} ${metadata.height}"></svg>`;
+  if (paths.length === 0 || !tracedViewBox) {
+    // Fallback: return empty SVG with original dimensions
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
   }
 
   // Combine all paths into a single SVG
@@ -529,7 +583,10 @@ async function vectorizeWithColors(
     .map(p => `\t<path d="${p.d}" fill="${p.color}" fill-rule="evenodd"/>`)
     .join('\n');
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${viewBox.width}" height="${viewBox.height}" viewBox="0 0 ${viewBox.width} ${viewBox.height}" version="1.1">
+  // Use original dimensions for display size, traced dimensions for viewBox
+  // This lets SVG's built-in scaling handle the coordinate transformation
+  // The paths are traced at higher resolution, giving smoother curves
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${tracedViewBox.width} ${tracedViewBox.height}" version="1.1">
 ${pathElements}
 </svg>`;
 }
@@ -546,9 +603,12 @@ export async function vectorizeImage(
     threshold = 128,
     colorCount = 2,
     turdPolicy = 'minority',
-    optTolerance = 0.2,
+    optTolerance = 0.1,
     preserveColors = true,
     colorTolerance = 20,
+    turdSize = 2,
+    alphaMax = 0.75,
+    upscale = 2,
   } = options;
 
   // Use color-preserving vectorization by default
@@ -557,6 +617,9 @@ export async function vectorizeImage(
       turdPolicy,
       optTolerance,
       colorTolerance,
+      turdSize,
+      alphaMax,
+      upscale,
     });
   }
 
@@ -570,6 +633,8 @@ export async function vectorizeImage(
   const potraceOptions: potrace.PotraceOptions = {
     threshold,
     turdPolicy,
+    turdSize,
+    alphaMax,
     optTolerance,
     optCurve: true,
     background: 'transparent',
@@ -634,6 +699,9 @@ export async function convertImageToSvg(
     optTolerance: options.optTolerance,
     preserveColors: options.preserveColors ?? true,
     colorTolerance: options.colorTolerance,
+    turdSize: options.turdSize,
+    alphaMax: options.alphaMax,
+    upscale: options.upscale,
   });
 
   return svg;
